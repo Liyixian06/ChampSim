@@ -1,0 +1,96 @@
+#include "cache.h"
+
+#define LOOKAHEAD 1
+#define DEGREE 12
+
+struct GHB_entry {
+    uint64_t cl;
+    unsigned int prev_ptr = -1;
+};
+
+struct IT_entry {
+    unsigned int GHB_entry_addr = -1;
+};
+
+struct GHB_entry GHB_buffer[256];
+struct IT_entry IT[256];
+unsigned int GHB_index = 0;
+
+
+void CACHE::l2c_prefetcher_initialize()
+{
+    cout << "CPU " << cpu << " L2C GHB Stride prefetcher" << endl;
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    // 如果 GHB 满了，就将 GHB_index 处的项移除
+    for(int i = 0; i < 256; i++){
+        if(IT[i].GHB_entry_addr == GHB_index)
+            IT[i].GHB_entry_addr = -1;
+        if(GHB_buffer[i].prev_ptr == GHB_index)
+            GHB_buffer[i].prev_ptr = -1;
+    }
+
+    // 把当前的 entry 串入链表
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    GHB_buffer[GHB_index].cl = cl_addr;
+    unsigned int ip_mask = ip & 0xff;
+    GHB_buffer[GHB_index].prev_ptr = ip_mask;
+    IT[ip_mask].GHB_entry_addr = GHB_index;
+    
+    // 取出最后三个访问的地址
+    uint64_t last_access_addr[3] = {0};
+    last_access_addr[0] = GHB_buffer[GHB_index].cl;
+    if(GHB_buffer[GHB_index].prev_ptr != -1){
+        last_access_addr[1] = GHB_buffer[GHB_buffer[GHB_index].prev_ptr].cl;
+        if(GHB_buffer[GHB_buffer[GHB_index].prev_ptr].prev_ptr != -1)
+            last_access_addr[2] = GHB_buffer[GHB_buffer[GHB_buffer[GHB_index].prev_ptr].prev_ptr].cl;
+        else {
+            GHB_index = (GHB_index + 1) % 256;
+            return metadata_in;
+        }
+    } else {
+        GHB_index = (GHB_index + 1) % 256;
+        return metadata_in;
+    }
+    // 指向下一个 entry
+    GHB_index = (GHB_index + 1) % 256;
+
+    // 判断最近三个访问地址的 stride 是否相等，相等则预取
+    int64_t prev_stride = 0;
+    for (int i = 0; i < 2; i++){
+        int64_t curr_stride = 0;
+        if(last_access_addr[i] > last_access_addr[i+1])
+            curr_stride = last_access_addr[i] - last_access_addr[i+1];
+        else {
+            curr_stride = last_access_addr[i+1] - last_access_addr[i];
+            curr_stride *= -1;
+        }
+        
+        if(prev_stride == curr_stride){
+            for(int i = 0; i < DEGREE; i++){
+                uint64_t pref_addr = (cl_addr + LOOKAHEAD * (curr_stride * (i+1))) << LOG2_BLOCK_SIZE;
+                // 只有在同一个页上时才预取
+                if((pref_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    break;
+                if(MSHR.occupancy < (MSHR.SIZE >> 1))
+                    prefetch_line(ip, addr, pref_addr, FILL_L2, 0);
+                else
+                    prefetch_line(ip, addr, pref_addr, FILL_LLC, 0);
+            }
+        }
+        prev_stride = curr_stride;
+    }
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+   cout << "CPU " << cpu << " L2C GHB Stride prefetcher final stats" << endl;
+}
